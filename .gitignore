@@ -42,3 +42,8 @@ coverage/
 # Misc
 tmp/
 temp/
+# Rust extras
+# Ignore local Cargo files and lockfile for library-style projects
+backend/.cargo/
+backend/Cargo.lock
+**/*.rs.bk
