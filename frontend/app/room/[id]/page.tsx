@@ -1,31 +1,124 @@
 "use client";
 
-/* ============================================================
-   Room Page – full multi-peer WebRTC + premium UI
-   ============================================================ */
-
-import {
-  useEffect,
-  useRef,
-  useState,
-  useCallback,
-  useMemo,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { api } from "../../../services/api";
 import { useAuthStore } from "../../../store/auth";
 import type { Message } from "../../../types/api";
 
-/* ── Types ──────────────────────────────────────────────────── */
-interface PeerEntry {
+interface PeerView {
   userId: string;
-  pc: RTCPeerConnection;
-  stream: MediaStream | null;
+  stream: MediaStream;
   micOn: boolean;
   camOn: boolean;
+  connectionState: RTCPeerConnectionState;
 }
 
-/* ── SVG Icons ──────────────────────────────────────────────── */
+interface PeerRuntime {
+  userId: string;
+  pc: RTCPeerConnection;
+  stream: MediaStream;
+  polite: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  isSettingRemoteAnswerPending: boolean;
+}
+
+type SignalMessage = {
+  type: string;
+  roomId?: string;
+  userId?: string;
+  from?: string;
+  to?: string;
+  users?: string[];
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
+};
+
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+];
+
+const PALETTE = [
+  "linear-gradient(135deg,#6366f1,#8b5cf6)",
+  "linear-gradient(135deg,#0ea5e9,#6366f1)",
+  "linear-gradient(135deg,#10b981,#0ea5e9)",
+  "linear-gradient(135deg,#f59e0b,#ef4444)",
+  "linear-gradient(135deg,#ec4899,#8b5cf6)",
+  "linear-gradient(135deg,#14b8a6,#6366f1)",
+];
+
+function avatarColor(uid: string) {
+  let h = 0;
+  for (let i = 0; i < uid.length; i += 1) h = (h * 31 + uid.charCodeAt(i)) >>> 0;
+  return PALETTE[h % PALETTE.length];
+}
+
+function getWsBaseUrl() {
+  const rawBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? api.defaults.baseURL ?? "http://127.0.0.1:8080";
+  return rawBase.replace(/^http/i, "ws").replace(/\/$/, "");
+}
+
+function formatParticipantLabel(userId: string, currentUserId?: string) {
+  if (userId === currentUserId) return "You";
+  return userId.length > 12 ? `${userId.slice(0, 8)}…${userId.slice(-4)}` : userId;
+}
+
+function VideoTile({
+  stream,
+  label,
+  userId,
+  isLocal,
+  micOn,
+  camOn,
+  status,
+}: {
+  stream: MediaStream | null;
+  label: string;
+  userId: string;
+  isLocal?: boolean;
+  micOn: boolean;
+  camOn: boolean;
+  status?: string;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.srcObject = stream;
+  }, [stream]);
+
+  const initial = label.charAt(0).toUpperCase() || "?";
+  const hasVideo = Boolean(stream && stream.getVideoTracks().length > 0 && camOn);
+
+  return (
+    <div className={`vt-tile${isLocal ? " vt-local" : ""}`}>
+      {hasVideo ? (
+        <video ref={videoRef} autoPlay playsInline muted={isLocal} className="vt-video" />
+      ) : (
+        <div className="vt-placeholder">
+          <div className="vt-avatar" style={{ background: avatarColor(userId) }}>
+            {initial}
+          </div>
+          <span className="vt-cam-label">{camOn ? "Joining video…" : "Camera off"}</span>
+        </div>
+      )}
+
+      <div className="vt-overlay">
+        <span className="vt-name">
+          {label}
+          {isLocal && <span className="vt-you-tag">you</span>}
+        </span>
+        <span className="vt-icons">
+          {!micOn && <span className="vt-icon-badge">Mic off</span>}
+          {!camOn && <span className="vt-icon-badge">Cam off</span>}
+          {status && <span className="vt-icon-badge">{status}</span>}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 const MicIcon = ({ off }: { off?: boolean }) => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
     {off ? (
@@ -115,274 +208,398 @@ const BackArrowIcon = () => (
   </svg>
 );
 
-/* ── ICE servers ─────────────────────────────────────────────── */
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-];
-
-/* ── Avatar colour ───────────────────────────────────────────── */
-const PALETTE = [
-  "linear-gradient(135deg,#6366f1,#8b5cf6)",
-  "linear-gradient(135deg,#0ea5e9,#6366f1)",
-  "linear-gradient(135deg,#10b981,#0ea5e9)",
-  "linear-gradient(135deg,#f59e0b,#ef4444)",
-  "linear-gradient(135deg,#ec4899,#8b5cf6)",
-  "linear-gradient(135deg,#14b8a6,#6366f1)",
-];
-function avatarColor(uid: string) {
-  let h = 0;
-  for (let i = 0; i < uid.length; i++) h = (h * 31 + uid.charCodeAt(i)) >>> 0;
-  return PALETTE[h % PALETTE.length];
-}
-
-/* ── VideoTile ───────────────────────────────────────────────── */
-function VideoTile({
-  stream, label, userId, isLocal, micOn, camOn, speaking,
-}: {
-  stream: MediaStream | null;
-  label: string;
-  userId: string;
-  isLocal?: boolean;
-  micOn: boolean;
-  camOn: boolean;
-  speaking?: boolean;
-}) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  useEffect(() => {
-    if (videoRef.current && stream) videoRef.current.srcObject = stream;
-  }, [stream]);
-
-  const initial = label.charAt(0).toUpperCase() || "?";
-  const bg = avatarColor(userId);
-  const hasVideo =
-    !!stream &&
-    stream.getVideoTracks().some((t) => t.enabled) &&
-    camOn;
-
-  return (
-    <div className={`vt-tile${speaking ? " vt-speaking" : ""}${isLocal ? " vt-local" : ""}`}>
-      {hasVideo ? (
-        <video ref={videoRef} autoPlay playsInline muted={isLocal} className="vt-video" />
-      ) : (
-        <div className="vt-placeholder">
-          <div className="vt-avatar" style={{ background: bg }}>{initial}</div>
-          <span className="vt-cam-label">Camera off</span>
-        </div>
-      )}
-      <div className="vt-overlay">
-        <span className="vt-name">
-          {label}
-          {isLocal && <span className="vt-you-tag">you</span>}
-        </span>
-        <span className="vt-icons">
-          {!micOn && <span className="vt-icon-badge" title="Muted"><MicIcon off /></span>}
-          {!camOn && <span className="vt-icon-badge" title="Camera off"><CamIcon off /></span>}
-        </span>
-      </div>
-      {speaking && <div className="vt-ring" />}
-    </div>
-  );
-}
-
-/* ═══════════════════════════════════════════════════════════════
-   Main Page
-═══════════════════════════════════════════════════════════════ */
 export default function RoomPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const { token, user, rooms } = useAuthStore();
-  const room = useMemo(() => rooms.find((r) => r.id === params.id), [rooms, params.id]);
+  const room = useMemo(() => rooms.find((entry) => entry.id === params.id), [rooms, params.id]);
 
-  /* ── chat state ─────────────────────────────────────────────── */
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
   const [chatOpen, setChatOpen] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  /* ── local AV controls ──────────────────────────────────────── */
   const [micOn, setMicOn] = useState(true);
   const [camOn, setCamOn] = useState(true);
+  const [mediaReady, setMediaReady] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [statusText, setStatusText] = useState("Preparing camera and microphone…");
 
-  /* ── WebRTC state ───────────────────────────────────────────── */
-  const [peers, setPeers] = useState<Map<string, PeerEntry>>(new Map());
-  const peersRef = useRef<Map<string, PeerEntry>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const peersRef = useRef<Map<string, PeerRuntime>>(new Map());
+  const [peerViews, setPeerViews] = useState<Map<string, PeerView>>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
-  const [wsConnected, setWsConnected] = useState(false);
 
-  /* guard */
-  useEffect(() => {
-    if (!token) router.push("/login");
-  }, [token, router]);
+  const roomName = room?.name ?? `Room ${params.id.slice(0, 8)}`;
+  const peerList = useMemo(() => Array.from(peerViews.values()), [peerViews]);
+  const totalCount = peerList.length + 1;
+  const gridClass =
+    totalCount === 1 ? "vg-solo" : totalCount === 2 ? "vg-duo" : totalCount <= 4 ? "vg-quad" : "vg-many";
 
-  /* ── Acquire local media ────────────────────────────────────── */
-  useEffect(() => {
-    let active = true;
-    (async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        if (!active) { stream.getTracks().forEach((t) => t.stop()); return; }
-        localStreamRef.current = stream;
-        setLocalStream(stream);
-      } catch {
-        const empty = new MediaStream();
-        localStreamRef.current = empty;
-        setLocalStream(empty);
-      }
-    })();
-    return () => { active = false; };
+  const updatePeerView = useCallback((peer: PeerRuntime) => {
+    const remoteVideoTracks = peer.stream.getVideoTracks();
+    const remoteAudioTracks = peer.stream.getAudioTracks();
+
+    setPeerViews((prev) => {
+      const next = new Map(prev);
+      next.set(peer.userId, {
+        userId: peer.userId,
+        stream: peer.stream,
+        camOn: remoteVideoTracks.length > 0 && remoteVideoTracks.some((track) => track.readyState === "live"),
+        micOn: remoteAudioTracks.length > 0 && remoteAudioTracks.some((track) => track.readyState === "live"),
+        connectionState: peer.pc.connectionState,
+      });
+      return next;
+    });
   }, []);
 
-  useEffect(() => {
-    localStreamRef.current?.getAudioTracks().forEach((t) => { t.enabled = micOn; });
-  }, [micOn]);
+  const removePeer = useCallback((remoteId: string) => {
+    const runtime = peersRef.current.get(remoteId);
+    if (runtime) {
+      runtime.pc.onicecandidate = null;
+      runtime.pc.ontrack = null;
+      runtime.pc.onnegotiationneeded = null;
+      runtime.pc.onconnectionstatechange = null;
+      runtime.pc.close();
+      peersRef.current.delete(remoteId);
+    }
 
-  useEffect(() => {
-    localStreamRef.current?.getVideoTracks().forEach((t) => { t.enabled = camOn; });
-  }, [camOn]);
+    setPeerViews((prev) => {
+      const next = new Map(prev);
+      next.delete(remoteId);
+      return next;
+    });
+  }, []);
 
-  /* ── Peer connection factory ────────────────────────────────── */
-  const createPeer = useCallback(
-    (remoteId: string, polite: boolean) => {
-      if (peersRef.current.has(remoteId)) return peersRef.current.get(remoteId)!.pc;
+  const sendSignal = useCallback((payload: SignalMessage) => {
+    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+    wsRef.current.send(JSON.stringify(payload));
+  }, []);
+
+  const ensurePeer = useCallback(
+    (remoteId: string) => {
+      const existing = peersRef.current.get(remoteId);
+      if (existing) return existing;
 
       const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-      localStreamRef.current?.getTracks().forEach((t) =>
-        pc.addTrack(t, localStreamRef.current!)
-      );
-
-      pc.ontrack = (ev) => {
-        const [remote] = ev.streams.length ? ev.streams : [new MediaStream([ev.track])];
-        setPeers((prev) => {
-          const next = new Map(prev);
-          const e = next.get(remoteId);
-          if (e) next.set(remoteId, { ...e, stream: remote });
-          return next;
-        });
-        const entry = peersRef.current.get(remoteId);
-        if (entry) entry.stream = remote;
+      const stream = new MediaStream();
+      const polite = (user?.id ?? "") > remoteId;
+      const runtime: PeerRuntime = {
+        userId: remoteId,
+        pc,
+        stream,
+        polite,
+        makingOffer: false,
+        ignoreOffer: false,
+        isSettingRemoteAnswerPending: false,
       };
 
-      pc.onicecandidate = (ev) => {
-        if (!ev.candidate) return;
-        wsRef.current?.readyState === WebSocket.OPEN &&
-          wsRef.current.send(
-            JSON.stringify({ type: "ice", to: remoteId, from: user!.id, candidate: ev.candidate })
-          );
+      peersRef.current.set(remoteId, runtime);
+
+      localStreamRef.current?.getTracks().forEach((track) => {
+        pc.addTrack(track, localStreamRef.current as MediaStream);
+      });
+
+      pc.ontrack = (event) => {
+        event.streams[0]?.getTracks().forEach((track) => {
+          const alreadyAttached = runtime.stream.getTracks().some((existingTrack) => existingTrack.id === track.id);
+          if (!alreadyAttached) runtime.stream.addTrack(track);
+
+          track.onmute = () => updatePeerView(runtime);
+          track.onunmute = () => updatePeerView(runtime);
+          track.onended = () => updatePeerView(runtime);
+        });
+
+        updatePeerView(runtime);
+      };
+
+      pc.onicecandidate = ({ candidate }) => {
+        if (!candidate || !user) return;
+        sendSignal({
+          type: "ice",
+          from: user.id,
+          to: remoteId,
+          candidate: candidate.toJSON(),
+        });
       };
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "failed" || pc.connectionState === "closed") {
-          removePeer(remoteId);
+        updatePeerView(runtime);
+        if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+          window.setTimeout(() => removePeer(remoteId), 400);
         }
       };
 
-      const entry: PeerEntry = { userId: remoteId, pc, stream: null, micOn: true, camOn: true };
-      peersRef.current.set(remoteId, entry);
-      setPeers((prev) => new Map(prev).set(remoteId, entry));
+      pc.onnegotiationneeded = async () => {
+        if (!user || user.id > remoteId) return;
 
-      if (!polite) {
-        pc.createOffer().then((offer) => pc.setLocalDescription(offer)).then(() => {
-          wsRef.current?.send(
-            JSON.stringify({ type: "offer", to: remoteId, from: user!.id, sdp: pc.localDescription })
-          );
-        }).catch(() => {/* ignore */});
-      }
+        try {
+          runtime.makingOffer = true;
+          await pc.setLocalDescription();
 
-      return pc;
+          if (pc.localDescription) {
+            sendSignal({
+              type: pc.localDescription.type,
+              from: user.id,
+              to: remoteId,
+              sdp: pc.localDescription.toJSON(),
+            });
+          }
+        } catch {
+          // ignore transient glare or teardown race
+        } finally {
+          runtime.makingOffer = false;
+        }
+      };
+
+      updatePeerView(runtime);
+      return runtime;
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [user]
+    [removePeer, sendSignal, updatePeerView, user]
   );
 
-  function removePeer(uid: string) {
-    const entry = peersRef.current.get(uid);
-    if (entry) { entry.pc.close(); peersRef.current.delete(uid); }
-    setPeers((prev) => { const next = new Map(prev); next.delete(uid); return next; });
-  }
+  const syncLocalTracks = useCallback(() => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
 
-  /* ── WebSocket signaling ────────────────────────────────────── */
-  useEffect(() => {
-    if (!user || !token) return;
+    peersRef.current.forEach((runtime) => {
+      const senders = runtime.pc.getSenders();
 
-    const wsBase = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080").replace(/^http/, "ws");
-    const ws = new WebSocket(`${wsBase}/ws/signal?room_id=${params.id}&user_id=${user.id}`);
-    wsRef.current = ws;
-
-    ws.onopen = () => setWsConnected(true);
-    ws.onclose = () => setWsConnected(false);
-
-    ws.onmessage = async (ev) => {
-      let msg: Record<string, unknown>;
-      try { msg = JSON.parse(ev.data as string); } catch { return; }
-      const { type, from: fromId } = msg as { type: string; from: string };
-      if (!fromId || fromId === user.id) return;
-
-      if (type === "join") {
-        createPeer(fromId, false);
-      } else if (type === "leave") {
-        removePeer(fromId);
-      } else if (type === "offer") {
-        const pc = createPeer(fromId, true);
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          ws.send(JSON.stringify({ type: "answer", to: fromId, from: user.id, sdp: pc.localDescription }));
-        } catch {/* ignore */}
-      } else if (type === "answer") {
-        const entry = peersRef.current.get(fromId);
-        if (entry?.pc.signalingState === "have-local-offer") {
-          try { await entry.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit)); }
-          catch {/* ignore */}
+      stream.getTracks().forEach((track) => {
+        const existingSender = senders.find((sender) => sender.track?.kind === track.kind);
+        if (existingSender) {
+          void existingSender.replaceTrack(track);
+        } else {
+          runtime.pc.addTrack(track, stream);
         }
-      } else if (type === "ice") {
-        const entry = peersRef.current.get(fromId);
-        if (entry && msg.candidate) {
-          try { await entry.pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit)); }
-          catch {/* ignore */}
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!token) router.push("/login");
+  }, [router, token]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const setupMedia = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: {
+            width: { ideal: 1280, max: 1920 },
+            height: { ideal: 720, max: 1080 },
+            frameRate: { ideal: 24, max: 30 },
+          },
+        });
+
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        localStreamRef.current = stream;
+        setLocalStream(stream);
+        setStatusText("Media ready. Connecting to room…");
+      } catch {
+        if (cancelled) return;
+
+        const fallback = new MediaStream();
+        localStreamRef.current = fallback;
+        setLocalStream(fallback);
+        setMicOn(false);
+        setCamOn(false);
+        setStatusText("Joined without camera or microphone access.");
+      } finally {
+        if (!cancelled) setMediaReady(true);
+      }
+    };
+
+    void setupMedia();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    localStreamRef.current?.getAudioTracks().forEach((track) => {
+      track.enabled = micOn;
+    });
+  }, [micOn]);
+
+  useEffect(() => {
+    localStreamRef.current?.getVideoTracks().forEach((track) => {
+      track.enabled = camOn;
+    });
+  }, [camOn]);
+
+  useEffect(() => {
+    if (!mediaReady) return;
+    syncLocalTracks();
+  }, [localStream, mediaReady, syncLocalTracks]);
+
+  useEffect(() => {
+    if (!mediaReady || !user || !token) return;
+
+    const ws = new WebSocket(`${getWsBaseUrl()}/ws?room_id=${encodeURIComponent(params.id)}&user_id=${encodeURIComponent(user.id)}`);
+    wsRef.current = ws;
+    setStatusText("Connecting to room…");
+
+    ws.onopen = () => {
+      setWsConnected(true);
+      setStatusText("Connected. Waiting for participants…");
+    };
+
+    ws.onclose = () => {
+      setWsConnected(false);
+      setStatusText("Disconnected from signaling server.");
+    };
+
+    ws.onerror = () => {
+      setStatusText("Realtime signaling error. Rejoin the room if calls stop.");
+    };
+
+    ws.onmessage = async (event) => {
+      let msg: SignalMessage;
+
+      try {
+        msg = JSON.parse(event.data as string) as SignalMessage;
+      } catch {
+        return;
+      }
+
+      const sourceId = msg.from ?? msg.userId;
+      if (msg.to && msg.to !== user.id) return;
+      if (sourceId === user.id) return;
+
+      if (msg.type === "participants") {
+        msg.users?.filter(Boolean).forEach((participantId) => {
+          if (participantId !== user.id) ensurePeer(participantId);
+        });
+        setStatusText(msg.users && msg.users.length > 0 ? "Participants connected." : "Waiting for participants…");
+        return;
+      }
+
+      if (!sourceId) return;
+
+      if (msg.type === "join") {
+        ensurePeer(sourceId);
+        setStatusText("Participant joined the room.");
+        return;
+      }
+
+      if (msg.type === "leave") {
+        removePeer(sourceId);
+        setStatusText("Participant left the room.");
+        return;
+      }
+
+      const runtime = ensurePeer(sourceId);
+      const description = msg.sdp;
+
+      if (description) {
+        const readyForOffer =
+          !runtime.makingOffer &&
+          (runtime.pc.signalingState === "stable" || runtime.isSettingRemoteAnswerPending);
+        const offerCollision = description.type === "offer" && !readyForOffer;
+
+        runtime.ignoreOffer = !runtime.polite && offerCollision;
+        if (runtime.ignoreOffer) return;
+
+        runtime.isSettingRemoteAnswerPending = description.type === "answer";
+
+        try {
+          await runtime.pc.setRemoteDescription(description);
+        } catch {
+          runtime.isSettingRemoteAnswerPending = false;
+          return;
+        }
+
+        runtime.isSettingRemoteAnswerPending = false;
+
+        if (description.type === "offer") {
+          try {
+            await runtime.pc.setLocalDescription();
+            if (runtime.pc.localDescription) {
+              sendSignal({
+                type: runtime.pc.localDescription.type,
+                from: user.id,
+                to: sourceId,
+                sdp: runtime.pc.localDescription.toJSON(),
+              });
+            }
+          } catch {
+            // ignore shutdown race
+          }
+        }
+
+        return;
+      }
+
+      if (msg.candidate) {
+        try {
+          await runtime.pc.addIceCandidate(msg.candidate);
+        } catch {
+          if (!runtime.ignoreOffer) {
+            // ignore race during teardown only
+          }
         }
       }
     };
 
     return () => {
+      wsRef.current = null;
       ws.close();
-      peersRef.current.forEach((e) => e.pc.close());
-      peersRef.current.clear();
-      setPeers(new Map());
-      localStreamRef.current?.getTracks().forEach((t) => t.stop());
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user, token, params.id]);
+      setWsConnected(false);
 
-  /* ── Chat ───────────────────────────────────────────────────── */
+      Array.from(peersRef.current.keys()).forEach((peerId) => {
+        removePeer(peerId);
+      });
+
+      peersRef.current.clear();
+      setPeerViews(new Map());
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, [ensurePeer, mediaReady, params.id, removePeer, sendSignal, token, user]);
+
   const loadMessages = useCallback(async () => {
     try {
-      const res = await api.get<Message[]>(`/api/chat/${params.id}`);
-      setMessages(res.data);
-    } catch {/* ignore */}
+      const response = await api.get<Message[]>(`/api/chat/${params.id}`);
+      setMessages(response.data);
+    } catch {
+      // keep latest good state
+    }
   }, [params.id]);
 
   useEffect(() => {
-    loadMessages();
-    const id = setInterval(loadMessages, 4000);
-    return () => clearInterval(id);
+    void loadMessages();
+    const intervalId = window.setInterval(() => {
+      void loadMessages();
+    }, 4000);
+
+    return () => window.clearInterval(intervalId);
   }, [loadMessages]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const sendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const sendMessage = async (event: React.FormEvent) => {
+    event.preventDefault();
     if (!chatInput.trim() || sending) return;
-    setSending(true);
+
     const text = chatInput.trim();
+    setSending(true);
     setChatInput("");
+
     try {
       await api.post("/api/chat/send", { room_id: params.id, content: text });
       await loadMessages();
@@ -393,62 +610,61 @@ export default function RoomPage() {
     }
   };
 
-  /* ── Screen share ───────────────────────────────────────────── */
   const shareScreen = async () => {
     try {
-      const ss = await (navigator.mediaDevices as typeof navigator.mediaDevices & {
-        getDisplayMedia(c: MediaStreamConstraints): Promise<MediaStream>;
-      }).getDisplayMedia({ video: true });
-      const track = ss.getVideoTracks()[0];
-      peersRef.current.forEach(({ pc }) => {
-        const s = pc.getSenders().find((x) => x.track?.kind === "video");
-        if (s) s.replaceTrack(track);
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 15, max: 24 } },
+        audio: false,
       });
-      track.onended = () => {
-        const camTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
-        peersRef.current.forEach(({ pc }) => {
-          const s = pc.getSenders().find((x) => x.track?.kind === "video");
-          if (s && camTrack) s.replaceTrack(camTrack);
+
+      const screenTrack = displayStream.getVideoTracks()[0];
+      if (!screenTrack) return;
+
+      peersRef.current.forEach((runtime) => {
+        const sender = runtime.pc.getSenders().find((entry) => entry.track?.kind === "video");
+        if (sender) void sender.replaceTrack(screenTrack);
+      });
+
+      screenTrack.onended = () => {
+        const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null;
+        peersRef.current.forEach((runtime) => {
+          const sender = runtime.pc.getSenders().find((entry) => entry.track?.kind === "video");
+          if (sender) void sender.replaceTrack(cameraTrack);
         });
       };
-    } catch {/* cancelled */}
+    } catch {
+      // user cancelled screen share
+    }
   };
 
   if (!token) return null;
 
-  const roomName = room?.name ?? `Room ${params.id.slice(0, 8)}`;
-  const peerList = Array.from(peers.values());
-  const totalCount = peerList.length + 1;
-  const gridClass =
-    totalCount === 1 ? "vg-solo"
-    : totalCount === 2 ? "vg-duo"
-    : totalCount <= 4 ? "vg-quad"
-    : "vg-many";
-
   return (
     <div className="room-shell">
-      {/* ── Header ───────────────────────────────────────────── */}
       <header className="room-header">
         <div className="rh-left">
-          <button className="rh-back-btn" onClick={() => router.push("/dashboard")} title="Back">
+          <button className="rh-back-btn" onClick={() => router.push("/dashboard")} title="Back to dashboard">
             <BackArrowIcon />
           </button>
           <div className="rh-divider" />
           <div className="rh-room-info">
             <div className="rh-room-name">
-              {room?.is_private === 1 && <span className="rh-lock"><LockSmIcon /></span>}
+              {room?.is_private === 1 && (
+                <span className="rh-lock">
+                  <LockSmIcon />
+                </span>
+              )}
               {roomName}
             </div>
             <div className="rh-room-sub">
-              <span
-                className="rh-signal-dot"
-                style={{ background: wsConnected ? "var(--success)" : "var(--warning)" }}
-              />
+              <span className="rh-signal-dot" style={{ background: wsConnected ? "var(--success)" : "var(--warning)" }} />
               <span style={{ color: wsConnected ? "var(--success)" : "var(--warning)", fontSize: 11 }}>
                 {wsConnected ? "Live" : "Connecting…"}
               </span>
               <span className="rh-sep">·</span>
               <span className="rh-room-id">{params.id.slice(0, 8)}…</span>
+              <span className="rh-sep">·</span>
+              <span>{statusText}</span>
             </div>
           </div>
         </div>
@@ -458,15 +674,9 @@ export default function RoomPage() {
             <PeopleIcon />
             <span>{totalCount} in room</span>
           </div>
-          <button
-            className={`rh-chat-btn${chatOpen ? " active" : ""}`}
-            onClick={() => setChatOpen((v) => !v)}
-            title="Toggle chat"
-          >
+          <button className={`rh-chat-btn${chatOpen ? " active" : ""}`} onClick={() => setChatOpen((value) => !value)} title="Toggle chat panel">
             <ChatBubbleIcon />
-            {messages.length > 0 && (
-              <span className="rh-badge">{messages.length > 99 ? "99+" : messages.length}</span>
-            )}
+            {messages.length > 0 && <span className="rh-badge">{messages.length > 99 ? "99+" : messages.length}</span>}
           </button>
           <button className="rh-leave" onClick={() => router.push("/dashboard")}>
             <PhoneOffIcon />
@@ -475,28 +685,30 @@ export default function RoomPage() {
         </div>
       </header>
 
-      {/* ── Body ─────────────────────────────────────────────── */}
       <div className="room-body-v2">
-        {/* Video grid */}
         <div className={`video-grid-v2 ${gridClass}`}>
           <VideoTile
             stream={localStream}
-            label={user?.username ?? "You"}
+            label={formatParticipantLabel(user?.id ?? "local", user?.id)}
             userId={user?.id ?? "local"}
             isLocal
             micOn={micOn}
             camOn={camOn}
+            status={localStream?.getTracks().length ? undefined : "No media"}
           />
+
           {peerList.map((peer) => (
             <VideoTile
               key={peer.userId}
               stream={peer.stream}
-              label={peer.userId.slice(0, 10)}
+              label={formatParticipantLabel(peer.userId, user?.id)}
               userId={peer.userId}
               micOn={peer.micOn}
               camOn={peer.camOn}
+              status={peer.connectionState === "connected" ? undefined : peer.connectionState}
             />
           ))}
+
           {totalCount === 1 && (
             <div className="vt-waiting">
               <div className="vt-waiting-inner">
@@ -507,14 +719,13 @@ export default function RoomPage() {
                   <path d="M16 3.13a4 4 0 0 1 0 7.75" />
                 </svg>
                 <p className="vt-waiting-text">Waiting for others to join…</p>
-                <p className="vt-waiting-hint">Share the room ID to invite</p>
+                <p className="vt-waiting-hint">Share the room ID to invite your team</p>
                 <span className="vt-waiting-id">{params.id.slice(0, 8)}</span>
               </div>
             </div>
           )}
         </div>
 
-        {/* Chat panel */}
         {chatOpen && (
           <aside className="chat-panel">
             <div className="cp-header">
@@ -534,8 +745,9 @@ export default function RoomPage() {
                 messages.map((msg) => {
                   const isMine = msg.user_id === user?.id;
                   const initChar = isMine
-                    ? (user?.username?.charAt(0).toUpperCase() ?? "?")
+                    ? user?.username?.charAt(0).toUpperCase() ?? "?"
                     : msg.user_id.charAt(0).toUpperCase();
+
                   return (
                     <div key={msg.id} className={`cp-msg${isMine ? " cp-mine" : ""}`}>
                       {!isMine && (
@@ -544,9 +756,7 @@ export default function RoomPage() {
                         </div>
                       )}
                       <div className="cp-msg-body">
-                        {!isMine && (
-                          <span className="cp-author">{msg.user_id.slice(0, 8)}</span>
-                        )}
+                        {!isMine && <span className="cp-author">{formatParticipantLabel(msg.user_id, user?.id)}</span>}
                         <div className={`cp-bubble${isMine ? " mine" : ""}`}>{msg.content}</div>
                       </div>
                     </div>
@@ -561,16 +771,11 @@ export default function RoomPage() {
                 type="text"
                 placeholder="Message room…"
                 value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
+                onChange={(event) => setChatInput(event.target.value)}
                 disabled={sending}
                 autoComplete="off"
               />
-              <button
-                type="submit"
-                className="cp-send"
-                disabled={sending || !chatInput.trim()}
-                title="Send"
-              >
+              <button type="submit" className="cp-send" disabled={sending || !chatInput.trim()} title="Send message">
                 {sending ? <span className="spinner" style={{ width: 14, height: 14 }} /> : <SendIcon />}
               </button>
             </form>
@@ -578,22 +783,13 @@ export default function RoomPage() {
         )}
       </div>
 
-      {/* ── Controls ─────────────────────────────────────────── */}
       <div className="controls-v2">
-        <button
-          className={`ctrl-v2${micOn ? "" : " ctrl-v2-off"}`}
-          onClick={() => setMicOn((v) => !v)}
-          title={micOn ? "Mute" : "Unmute"}
-        >
+        <button className={`ctrl-v2${micOn ? "" : " ctrl-v2-off"}`} onClick={() => setMicOn((value) => !value)} title={micOn ? "Mute microphone" : "Unmute microphone"}>
           <MicIcon off={!micOn} />
-          <span>{micOn ? "Mute" : "Unmuted"}</span>
+          <span>{micOn ? "Mute" : "Unmute"}</span>
         </button>
 
-        <button
-          className={`ctrl-v2${camOn ? "" : " ctrl-v2-off"}`}
-          onClick={() => setCamOn((v) => !v)}
-          title={camOn ? "Stop Camera" : "Start Camera"}
-        >
+        <button className={`ctrl-v2${camOn ? "" : " ctrl-v2-off"}`} onClick={() => setCamOn((value) => !value)} title={camOn ? "Stop camera" : "Start camera"}>
           <CamIcon off={!camOn} />
           <span>{camOn ? "Stop Cam" : "Start Cam"}</span>
         </button>
