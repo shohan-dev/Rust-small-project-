@@ -5,8 +5,10 @@ import { useRouter } from "next/navigation";
 import { useAuthStore } from "../store/auth";
 
 export default function Navbar() {
-  const { user, token, logout } = useAuthStore();
+  const { hydrated, user, token, logout } = useAuthStore();
   const router = useRouter();
+  const isAuthenticated = hydrated && Boolean(token && user);
+  const currentUser = isAuthenticated ? user : null;
 
   const handleLogout = () => {
     logout();
@@ -16,18 +18,18 @@ export default function Navbar() {
   return (
     <nav className="navbar">
       <div className="navbar-inner">
-        <Link href={token ? "/dashboard" : "/"} className="navbar-brand">
+        <Link href={isAuthenticated ? "/dashboard" : "/"} className="navbar-brand">
           <div className="navbar-brand-icon">🎥</div>
           <span>NexRoom</span>
         </Link>
 
         <div className="navbar-actions">
-          {token && user ? (
+          {!hydrated ? null : currentUser ? (
             <div className="navbar-user">
               <div className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>
-                {user.username.charAt(0).toUpperCase()}
+                {currentUser.username.charAt(0).toUpperCase()}
               </div>
-              <span>{user.username}</span>
+              <span>{currentUser.username}</span>
               <button className="btn btn-ghost btn-sm" onClick={handleLogout}>
                 Sign out
               </button>

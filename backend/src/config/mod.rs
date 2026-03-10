@@ -9,7 +9,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn from_env() -> Self {
-        let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port = std::env::var("PORT")
             .ok()
             .and_then(|v| v.parse::<u16>().ok())

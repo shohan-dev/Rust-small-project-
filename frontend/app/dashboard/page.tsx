@@ -46,7 +46,7 @@ const XIcon = () => (
 );
 
 export default function DashboardPage() {
-  const { token, user, rooms, addRoom, removeRoom } = useAuthStore();
+  const { hydrated, token, user, rooms, addRoom, removeRoom } = useAuthStore();
   const router = useRouter();
 
   const [showCreate, setShowCreate] = useState(false);
@@ -65,10 +65,11 @@ export default function DashboardPage() {
 
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [copiedId, setCopiedId]     = useState<string | null>(null);
+  const [copyError, setCopyError]   = useState("");
 
   useEffect(() => {
-    if (!token) router.push("/login");
-  }, [token, router]);
+    if (hydrated && !token) router.replace("/login");
+  }, [hydrated, token, router]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -118,12 +119,57 @@ export default function DashboardPage() {
     finally { removeRoom(id); setDeletingId(null); }
   };
 
-  const copyId = (id: string) => {
-    navigator.clipboard.writeText(id).then(() => {
+  const copyId = async (id: string) => {
+    setCopyError("");
+
+    const markCopied = () => {
       setCopiedId(id);
-      setTimeout(() => setCopiedId(null), 1500);
-    });
+      window.setTimeout(() => setCopiedId(null), 1500);
+    };
+
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(id);
+        markCopied();
+        return;
+      }
+
+      if (typeof document !== "undefined") {
+        const textarea = document.createElement("textarea");
+        textarea.value = id;
+        textarea.setAttribute("readonly", "true");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        textarea.style.pointerEvents = "none";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+
+        const copied = document.execCommand("copy");
+        document.body.removeChild(textarea);
+
+        if (copied) {
+          markCopied();
+          return;
+        }
+      }
+    } catch {
+      // Fall through to a user-visible error message.
+    }
+
+    setCopyError("Copy is not supported here. Please select and copy the room ID manually.");
   };
+
+  if (!hydrated) {
+    return (
+      <div className="auth-page">
+        <div className="card auth-status-card">
+          <span className="spinner" />
+          <p>Restoring your session…</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!token) return null;
 
@@ -222,6 +268,8 @@ export default function DashboardPage() {
             <span className="db-count">{rooms.length} room{rooms.length !== 1 ? "s" : ""}</span>
           )}
         </div>
+
+        {copyError && <p className="form-error" style={{ marginTop: 0, marginBottom: 14 }}>{copyError}</p>}
 
         {rooms.length === 0 ? (
           <div className="empty-state">

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { api } from "../../../services/api";
 import { useAuthStore } from "../../../store/auth";
-import type { Message } from "../../../types/api";
+import type { Message, Room } from "../../../types/api";
 
 /* ─── Types ──────────────────────────────────────────────────── */
 
@@ -42,14 +42,34 @@ type SignalMessage = {
   micOn?: boolean;
   camOn?: boolean;
   isScreenSharing?: boolean;
+  username?: string;
+  // Real-time chat fields
+  content?: string;
+  msgId?: string;
+  timestamp?: string;
 };
 
 /* ─── Constants ──────────────────────────────────────────────── */
 
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-];
+const ICE_SERVERS: RTCIceServer[] = (() => {
+  const servers: RTCIceServer[] = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+  ];
+
+  // Support configurable TURN server via environment variables.
+  // Set NEXT_PUBLIC_TURN_URL, NEXT_PUBLIC_TURN_USERNAME, NEXT_PUBLIC_TURN_CREDENTIAL
+  const turnUrl = process.env.NEXT_PUBLIC_TURN_URL;
+  if (turnUrl) {
+    servers.push({
+      urls: turnUrl,
+      username: process.env.NEXT_PUBLIC_TURN_USERNAME ?? "",
+      credential: process.env.NEXT_PUBLIC_TURN_CREDENTIAL ?? "",
+    });
+  }
+
+  return servers;
+})();
 
 const PALETTE = [
   "linear-gradient(135deg,#6366f1,#8b5cf6)",
@@ -67,6 +87,15 @@ function avatarColor(uid: string) {
 }
 
 function getWsBaseUrl() {
+  if (process.env.NEXT_PUBLIC_WS_BASE_URL) {
+    return process.env.NEXT_PUBLIC_WS_BASE_URL.replace(/\/$/, "");
+  }
+
+  if (typeof window !== "undefined") {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}`;
+  }
+
   const rawBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? api.defaults.baseURL ?? "http://127.0.0.1:8080";
   return rawBase.replace(/^http/i, "ws").replace(/\/$/, "");
 }
@@ -74,6 +103,17 @@ function getWsBaseUrl() {
 function formatParticipantLabel(userId: string, currentUserId?: string) {
   if (userId === currentUserId) return "You";
   return userId.length > 12 ? `${userId.slice(0, 8)}…${userId.slice(-4)}` : userId;
+}
+
+function syncTransceiverDirection(transceiver: RTCRtpTransceiver, hasTrack: boolean) {
+  if (hasTrack) {
+    if (transceiver.direction === "recvonly") transceiver.direction = "sendrecv";
+    if (transceiver.direction === "inactive") transceiver.direction = "sendonly";
+    return;
+  }
+
+  if (transceiver.direction === "sendrecv") transceiver.direction = "recvonly";
+  if (transceiver.direction === "sendonly") transceiver.direction = "inactive";
 }
 
 /* ─── VideoTile ──────────────────────────────────────────────── */
@@ -99,23 +139,60 @@ function VideoTile({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
+  /**
+   * Zoom / Google Meet strategy:
+   *  - The <video> element is ALWAYS mounted in the DOM.
+   *  - srcObject is ALWAYS assigned.
+   *  - Show / hide is determined purely by the declared media state
+   *    (camOn or isScreenSharing), NOT by checking track.muted or
+   *    track.readyState. A brief black frame during transitions is
+   *    normal and accepted — exactly like Zoom / Meet.
+   *  - The avatar / placeholder is an OVERLAY that sits on top of the
+   *    <video> and fades away when video should be visible.
+   */
   useEffect(() => {
-    if (videoRef.current) videoRef.current.srcObject = stream;
-  }, [stream]);
+    const el = videoRef.current;
+    if (!el) return;
+    if (stream) {
+      if (el.srcObject !== stream) {
+        el.srcObject = stream;
+      }
+      // Re-trigger play() whenever screen-sharing or camera state changes.
+      // replaceTrack() swaps content in-place without firing ontrack, so
+      // many browsers need a fresh play() call to render the new frames.
+      el.play().catch(() => { /* autoplay blocked until user gesture */ });
+    } else {
+      el.srcObject = null;
+    }
+  }, [stream, isScreenSharing, camOn]);
 
   const initial = label.charAt(0).toUpperCase() || "?";
-  const hasVideo = Boolean(stream && stream.getVideoTracks().length > 0 && (camOn || isScreenSharing));
+  const showVideo = camOn || Boolean(isScreenSharing);
 
   return (
     <div className={`vt-tile${isLocal ? " vt-local" : ""}`}>
-      {hasVideo ? (
-        <video ref={videoRef} autoPlay playsInline muted={isLocal} className="vt-video" />
-      ) : (
-        <div className="vt-placeholder">
-          <div className="vt-avatar" style={{ background: avatarColor(userId) }}>
+      {/* Video element is ALWAYS mounted — Zoom / Meet pattern */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted={isLocal}
+        className="vt-video"
+        style={{
+          objectFit: isScreenSharing ? "contain" : "cover",
+          background: isScreenSharing ? "#000" : undefined,
+          opacity: showVideo ? 1 : 0,
+          position: showVideo ? "relative" : "absolute",
+        }}
+      />
+
+      {/* Avatar overlay — visible when camera & screen share are off */}
+      {!showVideo && (
+        <div className="vt-placeholder" style={{ background: avatarColor(userId) }}>
+          <div className="vt-avatar" style={{ background: "rgba(0,0,0,0.25)" }}>
             {initial}
           </div>
-          <span className="vt-cam-label">{camOn ? "Joining video…" : "Camera off"}</span>
+          <span className="vt-cam-label">Camera off</span>
         </div>
       )}
 
@@ -125,10 +202,16 @@ function VideoTile({
           {isLocal && <span className="vt-you-tag">you</span>}
         </span>
         <span className="vt-icons">
-          {!micOn && <span className="vt-icon-badge">Mic off</span>}
-          {!camOn && !isScreenSharing && <span className="vt-icon-badge">Cam off</span>}
-          {isScreenSharing && <span className="vt-icon-badge">Presenting</span>}
-          {status && <span className="vt-icon-badge">{status}</span>}
+          {!micOn && <span className="vt-icon-badge vt-badge-muted">🔇</span>}
+          {!camOn && !isScreenSharing && (
+            <span className="vt-icon-badge">Cam off</span>
+          )}
+          {isScreenSharing && (
+            <span className="vt-icon-badge vt-badge-presenting">Presenting</span>
+          )}
+          {status && status !== "connected" && (
+            <span className="vt-icon-badge vt-badge-status">{status}</span>
+          )}
         </span>
       </div>
     </div>
@@ -241,6 +324,98 @@ const MEDIA_CONSTRAINTS: MediaStreamConstraints = {
   },
 };
 
+/** Fallback: simpler constraints for devices that reject specific resolutions. */
+const FALLBACK_VIDEO: MediaTrackConstraints = {
+  facingMode: "user",
+  width: { ideal: 640 },
+  height: { ideal: 480 },
+};
+
+/** Helper: try getUserMedia with primary constraints, then fallback, then bare minimum. */
+async function safeGetUserMedia(
+  constraints: MediaStreamConstraints,
+): Promise<MediaStream> {
+  // On non-secure origins (HTTP), navigator.mediaDevices is undefined
+  // in most mobile browsers (Android Chrome, iOS Safari).
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new DOMException(
+      "Camera/microphone requires HTTPS. Use localhost or an HTTPS URL.",
+      "NotAllowedError",
+    );
+  }
+
+  try {
+    return await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (err) {
+    // If the specific video constraints failed, try simpler ones.
+    if (constraints.video && constraints.video !== true) {
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          ...constraints,
+          video: FALLBACK_VIDEO,
+        });
+      } catch {
+        // If video still fails, try with just { video: true }.
+        try {
+          return await navigator.mediaDevices.getUserMedia({
+            ...constraints,
+            video: true,
+          });
+        } catch {
+          // Final attempt: video: {facingMode: "user"} — helps on some Android devices.
+          return await navigator.mediaDevices.getUserMedia({
+            ...constraints,
+            video: { facingMode: "user" },
+          });
+        }
+      }
+    }
+    throw err;
+  }
+}
+
+/**
+ * Adapt video encoding parameters based on participant count.
+ * Fewer participants = higher quality, more participants = lower quality.
+ */
+function getAdaptiveVideoParams(participantCount: number): {
+  maxBitrate: number;
+  maxFramerate: number;
+  scaleResolutionDownBy: number;
+} {
+  if (participantCount <= 2) {
+    return { maxBitrate: 1_500_000, maxFramerate: 30, scaleResolutionDownBy: 1 };
+  }
+  if (participantCount <= 4) {
+    return { maxBitrate: 800_000, maxFramerate: 24, scaleResolutionDownBy: 1.5 };
+  }
+  if (participantCount <= 8) {
+    return { maxBitrate: 500_000, maxFramerate: 20, scaleResolutionDownBy: 2 };
+  }
+  return { maxBitrate: 300_000, maxFramerate: 15, scaleResolutionDownBy: 2.5 };
+}
+
+/** Apply adaptive bitrate to all video senders on a peer connection. */
+async function applyAdaptiveBitrate(pc: RTCPeerConnection, peerCount: number) {
+  const params = getAdaptiveVideoParams(peerCount);
+  const senders = pc.getSenders().filter((s) => s.track?.kind === "video");
+
+  for (const sender of senders) {
+    try {
+      const sendParams = sender.getParameters();
+      if (!sendParams.encodings || sendParams.encodings.length === 0) {
+        sendParams.encodings = [{}];
+      }
+      sendParams.encodings[0].maxBitrate = params.maxBitrate;
+      sendParams.encodings[0].maxFramerate = params.maxFramerate;
+      sendParams.encodings[0].scaleResolutionDownBy = params.scaleResolutionDownBy;
+      await sender.setParameters(sendParams);
+    } catch {
+      // Some browsers don't support all encoding params — ignore.
+    }
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════════
    RoomPage — complete multi-peer WebRTC with perfect negotiation
    ═══════════════════════════════════════════════════════════════ */
@@ -248,14 +423,17 @@ const MEDIA_CONSTRAINTS: MediaStreamConstraints = {
 export default function RoomPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
-  const { token, user, rooms } = useAuthStore();
+  const { hydrated, token, user, rooms, addRoom } = useAuthStore();
   const room = useMemo(() => rooms.find((r) => r.id === params.id), [rooms, params.id]);
+  const [roomDetails, setRoomDetails] = useState<Room | null>(room ?? null);
 
   /* ── Chat state ─────────────────────────────────────────────── */
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [chatOpen, setChatOpen] = useState(true);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [participantsOpen, setParticipantsOpen] = useState(false);
+  const [participantNames, setParticipantNames] = useState<Map<string, string>>(new Map());
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   /* ── Media-control state ────────────────────────────────────── */
@@ -272,6 +450,7 @@ export default function RoomPage() {
   const audioTrackRef = useRef<MediaStreamTrack | null>(null);
   const cameraTrackRef = useRef<MediaStreamTrack | null>(null);
   const screenTrackRef = useRef<MediaStreamTrack | null>(null);
+  const screenAudioTrackRef = useRef<MediaStreamTrack | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
 
@@ -291,11 +470,23 @@ export default function RoomPage() {
   screenSharingRef.current = isScreenSharing;
 
   /* ── Derived ────────────────────────────────────────────────── */
-  const roomName = room?.name ?? `Room ${params.id.slice(0, 8)}`;
+  const roomName = roomDetails?.name ?? `Room ${params.id.slice(0, 8)}`;
   const peerList = useMemo(() => Array.from(peerViews.values()), [peerViews]);
   const totalCount = peerList.length + 1;
-  const gridClass =
-    totalCount === 1 ? "vg-solo" : totalCount === 2 ? "vg-duo" : totalCount <= 4 ? "vg-quad" : "vg-many";
+
+  // Detect if anyone (including self) is screen sharing for spotlight layout.
+  const screenSharingPeer = peerList.find((p) => p.isScreenSharing);
+  const hasScreenPresenter = isScreenSharing || Boolean(screenSharingPeer);
+
+  const gridClass = hasScreenPresenter
+    ? "vg-spotlight"
+    : totalCount === 1
+      ? "vg-solo"
+      : totalCount === 2
+        ? "vg-duo"
+        : totalCount <= 4
+          ? "vg-quad"
+          : "vg-many";
 
   /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
      Stable helper callbacks (all deps are [] or other stable fns)
@@ -314,14 +505,6 @@ export default function RoomPage() {
     localStreamRef.current = stream;
     setLocalStream(stream);
     return stream;
-  }, []);
-
-  /** Find an RTP sender by track kind, falling back to transceiver receiver kind. */
-  const findSender = useCallback((pc: RTCPeerConnection, kind: "audio" | "video"): RTCRtpSender | null => {
-    const directSender = pc.getSenders().find((s) => s.track?.kind === kind);
-    if (directSender) return directSender;
-    const transceiver = pc.getTransceivers().find((t) => t.receiver.track.kind === kind);
-    return transceiver?.sender ?? null;
   }, []);
 
   /** Flush a PeerRuntime snapshot into the React peerViews state for rendering. */
@@ -364,6 +547,43 @@ export default function RoomPage() {
     wsRef.current.send(JSON.stringify(payload));
   }, []);
 
+  const syncPeerTrack = useCallback(
+    (
+      pc: RTCPeerConnection,
+      kind: "audio" | "video",
+      track: MediaStreamTrack | null,
+      stream: MediaStream,
+    ) => {
+      // Find the transceiver for this media kind.  Check mid+kind first,
+      // then fallback to sender track kind, then receiver track kind.
+      const transceiver = pc.getTransceivers().find((t) => {
+        // Prefer matching by sender track kind (most reliable).
+        if (t.sender.track?.kind === kind) return true;
+        // Fallback: match by receiver track kind (for recvonly transceivers).
+        try {
+          if (t.receiver?.track?.kind === kind) return true;
+        } catch { /* receiver may not be ready */ }
+        return false;
+      });
+
+      if (transceiver) {
+        void transceiver.sender.replaceTrack(track).catch(() => {
+          // replaceTrack can fail if the transceiver is stopped.
+        });
+        syncTransceiverDirection(transceiver, Boolean(track));
+        return;
+      }
+
+      if (track) {
+        pc.addTrack(track, stream);
+        return;
+      }
+
+      pc.addTransceiver(kind, { direction: "recvonly" });
+    },
+    [],
+  );
+
   /** Replace/add local tracks on every peer connection. */
   const syncLocalMediaToPeers = useCallback(() => {
     const compositeStream = buildCompositeStream();
@@ -371,22 +591,10 @@ export default function RoomPage() {
     const videoTrack = screenTrackRef.current ?? cameraTrackRef.current;
 
     peersRef.current.forEach((runtime) => {
-      const audioSender = findSender(runtime.pc, "audio");
-      const videoSender = findSender(runtime.pc, "video");
-
-      if (audioSender) {
-        void audioSender.replaceTrack(audioTrack);
-      } else if (audioTrack) {
-        runtime.pc.addTrack(audioTrack, compositeStream);
-      }
-
-      if (videoSender) {
-        void videoSender.replaceTrack(videoTrack);
-      } else if (videoTrack) {
-        runtime.pc.addTrack(videoTrack, compositeStream);
-      }
+      syncPeerTrack(runtime.pc, "audio", audioTrack, compositeStream);
+      syncPeerTrack(runtime.pc, "video", videoTrack, compositeStream);
     });
-  }, [buildCompositeStream, findSender]);
+  }, [buildCompositeStream, syncPeerTrack]);
 
   /**
    * Publish current mic/cam/screen state to all peers.
@@ -411,11 +619,16 @@ export default function RoomPage() {
   /* ── Track acquisition helpers ─────────────────────────────── */
 
   const ensureAudioTrack = useCallback(async () => {
-    if (audioTrackRef.current && audioTrackRef.current.readyState === "live") {
-      return audioTrackRef.current;
+    // Clear stale ref — the track may have ended without triggering onended.
+    if (audioTrackRef.current && audioTrackRef.current.readyState !== "live") {
+      audioTrackRef.current = null;
     }
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: MEDIA_CONSTRAINTS.audio, video: false });
+    if (audioTrackRef.current) return audioTrackRef.current;
+
+    const stream = await safeGetUserMedia({ audio: MEDIA_CONSTRAINTS.audio, video: false });
     const track = stream.getAudioTracks()[0] ?? null;
+    // Stop any video tracks that might have been acquired accidentally.
+    stream.getVideoTracks().forEach((t) => t.stop());
     if (track) {
       track.enabled = true;
       audioTrackRef.current = track;
@@ -423,18 +636,26 @@ export default function RoomPage() {
         if (audioTrackRef.current?.id === track.id) {
           audioTrackRef.current = null;
           setMicOn(false);
+          buildCompositeStream();
+          syncLocalMediaToPeers();
+          publishMediaState({ micOn: false });
         }
       };
     }
     return track;
-  }, []);
+  }, [buildCompositeStream, publishMediaState, syncLocalMediaToPeers]);
 
   const ensureCameraTrack = useCallback(async () => {
-    if (cameraTrackRef.current && cameraTrackRef.current.readyState === "live") {
-      return cameraTrackRef.current;
+    // Clear stale ref — the track may have ended without triggering onended.
+    if (cameraTrackRef.current && cameraTrackRef.current.readyState !== "live") {
+      cameraTrackRef.current = null;
     }
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: MEDIA_CONSTRAINTS.video });
+    if (cameraTrackRef.current) return cameraTrackRef.current;
+
+    const stream = await safeGetUserMedia({ audio: false, video: MEDIA_CONSTRAINTS.video });
     const track = stream.getVideoTracks()[0] ?? null;
+    // Stop any audio tracks that might have been acquired accidentally.
+    stream.getAudioTracks().forEach((t) => t.stop());
     if (track) {
       track.enabled = true;
       track.contentHint = "motion";
@@ -443,13 +664,14 @@ export default function RoomPage() {
         if (cameraTrackRef.current?.id === track.id) {
           cameraTrackRef.current = null;
           setCamOn(false);
+          buildCompositeStream();
           syncLocalMediaToPeers();
           publishMediaState({ camOn: false });
         }
       };
     }
     return track;
-  }, [syncLocalMediaToPeers, publishMediaState]);
+  }, [buildCompositeStream, syncLocalMediaToPeers, publishMediaState]);
 
   const stopScreenShare = useCallback(
     (fromTrackEnd = false) => {
@@ -460,12 +682,27 @@ export default function RoomPage() {
         track.onended = null;
         if (!fromTrackEnd) track.stop();
       }
+      // Stop and clean up screen audio track.
+      const audioTrack = screenAudioTrackRef.current;
+      screenAudioTrackRef.current = null;
+      if (audioTrack) {
+        audioTrack.stop();
+        // Remove screen audio senders from all peer connections.
+        peersRef.current.forEach((runtime) => {
+          const sender = runtime.pc.getSenders().find((s) => s.track === audioTrack);
+          if (sender) {
+            try { runtime.pc.removeTrack(sender); } catch { /* PC may be closed */ }
+          }
+        });
+      }
       // Restore camera if it was on (read from ref for stable closure).
       if (cameraTrackRef.current) cameraTrackRef.current.enabled = camOnRef.current;
-      syncLocalMediaToPeers();
+      // Publish state BEFORE syncing tracks so peers know we stopped sharing.
       publishMediaState({ isScreenSharing: false });
+      buildCompositeStream();
+      syncLocalMediaToPeers();
     },
-    [syncLocalMediaToPeers, publishMediaState],
+    [syncLocalMediaToPeers, publishMediaState, buildCompositeStream],
   );
 
   /* ── Peer creation (uses refs — no state deps) ─────────────── */
@@ -488,7 +725,7 @@ export default function RoomPage() {
         ignoreOffer: false,
         isSettingRemoteAnswerPending: false,
         micOn: true,
-        camOn: true,
+        camOn: false,   // Default OFF — show gradient avatar until media-state confirms camera is on.
         isScreenSharing: false,
       };
 
@@ -496,23 +733,41 @@ export default function RoomPage() {
 
       // Feed local tracks into the peer connection.
       const localTracks = compositeStream.getTracks();
-      if (localTracks.length > 0) {
-        localTracks.forEach((track) => pc.addTrack(track, compositeStream));
-      } else {
-        // No local media — add recvonly transceivers so negotiation still starts
-        // and we can receive remote audio/video.
+      const hasAudioTrack = localTracks.some((t) => t.kind === "audio");
+      const hasVideoTrack = localTracks.some((t) => t.kind === "video");
+      localTracks.forEach((track) => pc.addTrack(track, compositeStream));
+
+      // Always ensure both audio and video transceivers exist so that:
+      //  (a) We can RECEIVE remote media even when not sending that kind.
+      //  (b) The initial SDP contains both m-lines, allowing a later
+      //      screen-share to use the fast replaceTrack() path instead of
+      //      the heavier addTrack + full renegotiation path.
+      if (!hasAudioTrack) {
         pc.addTransceiver("audio", { direction: "recvonly" });
+      }
+      if (!hasVideoTrack) {
         pc.addTransceiver("video", { direction: "recvonly" });
       }
 
-      /* ontrack — accumulate remote tracks into runtime.stream */
+      /* ontrack — accumulate remote tracks into runtime.stream.
+       * After adding tracks we create a NEW MediaStream so that the
+       * React component receives a different object reference, which
+       * triggers the VideoTile useEffect to re-assign srcObject and
+       * call play(). Without this, replaceTrack()-driven content
+       * changes and late-arriving tracks would never be rendered. */
       pc.ontrack = (event) => {
         const [remoteStream] = event.streams;
         const addTrack = (track: MediaStreamTrack) => {
           if (!runtime.stream.getTracks().some((t) => t.id === track.id)) {
             runtime.stream.addTrack(track);
           }
-          track.onended = () => updatePeerView(runtime);
+          track.onended = () => {
+            // Rebuild stream without ended tracks so the video element
+            // drops the dead track and React detects the change.
+            const liveTracks = runtime.stream.getTracks().filter((t) => t.readyState === "live");
+            runtime.stream = new MediaStream(liveTracks);
+            updatePeerView(runtime);
+          };
           track.onmute = () => updatePeerView(runtime);
           track.onunmute = () => updatePeerView(runtime);
         };
@@ -522,6 +777,9 @@ export default function RoomPage() {
         } else {
           addTrack(event.track);
         }
+        // Create a new MediaStream reference with all accumulated tracks
+        // so React detects the change and VideoTile re-assigns srcObject.
+        runtime.stream = new MediaStream(runtime.stream.getTracks());
         updatePeerView(runtime);
       };
 
@@ -577,6 +835,14 @@ export default function RoomPage() {
         isScreenSharing: screenSharingRef.current,
       });
 
+      // Share our display name so the remote peer can label us.
+      sendSignal({
+        type: "user-info",
+        from: uid,
+        to: remoteId,
+        username: userRef.current?.username ?? uid,
+      });
+
       return runtime;
     },
     [buildCompositeStream, removePeer, sendSignal, updatePeerView],
@@ -588,24 +854,53 @@ export default function RoomPage() {
 
   /* 1. Auth guard */
   useEffect(() => {
-    if (!token) router.push("/login");
-  }, [router, token]);
+    if (hydrated && !token) router.replace("/login");
+  }, [hydrated, router, token]);
 
-  /* 2. Acquire local media (runs once) */
+  useEffect(() => {
+    setRoomDetails(room ?? null);
+  }, [room]);
+
+  useEffect(() => {
+    if (!hydrated || !token || room) return;
+
+    let active = true;
+
+    const loadRoomDetails = async () => {
+      try {
+        const res = await api.get<Room>(`/api/rooms/${params.id}`);
+        if (!active) return;
+        setRoomDetails(res.data);
+        addRoom(res.data);
+      } catch {
+        if (active) setStatusText("Unable to load room details.");
+      }
+    };
+
+    void loadRoomDetails();
+
+    return () => {
+      active = false;
+    };
+  }, [addRoom, hydrated, params.id, room, token]);
+
+  /* 2. Acquire local media — audio and video acquired SEPARATELY so
+   *    one failing (e.g. no camera permission) doesn't kill the other.
+   *    IMPORTANT: even if BOTH fail, we still set mediaReady=true so the
+   *    WebSocket connects and the user can participate with just audio or
+   *    as a viewer with a coloured avatar tile (Google Meet style). */
   useEffect(() => {
     let cancelled = false;
 
     const setup = async () => {
+      let gotAudio = false;
+      let gotVideo = false;
+
+      // ── Audio ──────────────────────────────────────────
       try {
-        const stream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-
-        const audioTrack = stream.getAudioTracks()[0] ?? null;
-        const videoTrack = stream.getVideoTracks()[0] ?? null;
-
+        const audioStream = await safeGetUserMedia({ audio: MEDIA_CONSTRAINTS.audio, video: false });
+        if (cancelled) { audioStream.getTracks().forEach((t) => t.stop()); return; }
+        const audioTrack = audioStream.getAudioTracks()[0] ?? null;
         if (audioTrack) {
           audioTrack.enabled = true;
           audioTrackRef.current = audioTrack;
@@ -613,10 +908,24 @@ export default function RoomPage() {
             if (audioTrackRef.current?.id === audioTrack.id) {
               audioTrackRef.current = null;
               setMicOn(false);
+              buildCompositeStream();
+              syncLocalMediaToPeers();
+              publishMediaState({ micOn: false });
             }
           };
+          gotAudio = true;
         }
+      } catch (err) {
+        if (cancelled) return;
+        console.warn("[NexRoom] Audio acquisition failed:", (err as Error)?.name, (err as Error)?.message);
+        setMicOn(false);
+      }
 
+      // ── Video ──────────────────────────────────────────
+      try {
+        const videoStream = await safeGetUserMedia({ audio: false, video: MEDIA_CONSTRAINTS.video });
+        if (cancelled) { videoStream.getTracks().forEach((t) => t.stop()); return; }
+        const videoTrack = videoStream.getVideoTracks()[0] ?? null;
         if (videoTrack) {
           videoTrack.enabled = true;
           videoTrack.contentHint = "motion";
@@ -625,29 +934,48 @@ export default function RoomPage() {
             if (cameraTrackRef.current?.id === videoTrack.id) {
               cameraTrackRef.current = null;
               setCamOn(false);
+              buildCompositeStream();
+              syncLocalMediaToPeers();
+              publishMediaState({ camOn: false });
             }
           };
+          gotVideo = true;
         }
-
-        buildCompositeStream();
-        setStatusText("Media ready. Connecting to room…");
-      } catch {
+      } catch (err) {
         if (cancelled) return;
-        buildCompositeStream();
-        setMicOn(false);
+        console.warn("[NexRoom] Video acquisition failed:", (err as Error)?.name, (err as Error)?.message);
         setCamOn(false);
-        setStatusText("Joined without camera or microphone access.");
-      } finally {
-        if (!cancelled) setMediaReady(true);
       }
+
+      if (cancelled) return;
+
+      buildCompositeStream();
+
+      if (gotAudio && gotVideo) {
+        setStatusText("Media ready. Connecting to room…");
+      } else if (gotAudio) {
+        setStatusText("Microphone ready. Camera unavailable — showing avatar.");
+      } else if (gotVideo) {
+        setStatusText("Camera ready. Microphone unavailable.");
+      } else {
+        const isSecure = typeof window !== "undefined" &&
+          (window.location.protocol === "https:" || window.location.hostname === "localhost");
+        if (!isSecure) {
+          setStatusText("Camera/mic require HTTPS. Use localhost or an HTTPS URL to enable media.");
+        } else {
+          setStatusText("No camera or mic detected — joined as viewer.");
+        }
+      }
+
+      // ALWAYS mark media as ready so WS connection proceeds even with no media.
+      setMediaReady(true);
     };
 
     void setup();
     return () => {
       cancelled = true;
     };
-    // buildCompositeStream is stable (no deps).
-  }, [buildCompositeStream]);
+  }, [buildCompositeStream, publishMediaState, syncLocalMediaToPeers]);
 
   /* 3. Keep track .enabled in sync with toggle state */
   useEffect(() => {
@@ -666,55 +994,103 @@ export default function RoomPage() {
     publishMediaState();
   }, [micOn, camOn, isScreenSharing, wsConnected, publishMediaState]);
 
-  /* 5. WebSocket connection + signaling
+  /* 4b. Adapt video bitrate based on participant count */
+  useEffect(() => {
+    const count = peerViews.size + 1;
+    peersRef.current.forEach((runtime) => {
+      void applyAdaptiveBitrate(runtime.pc, count);
+    });
+  }, [peerViews.size]);
+
+  /* 5. WebSocket connection + signaling with auto-reconnection
    *    Dependencies are ONLY things that change once or are stable.
    *    publishMediaState / ensurePeer / etc. are stable so they never
    *    tear the WS down on mic/cam toggles.
    */
   useEffect(() => {
-    if (!mediaReady || !token) return;
+    if (!mediaReady || !hydrated || !token) return;
     const currentUser = userRef.current;
     if (!currentUser) return;
     const userId = currentUser.id;
 
-    const ws = new WebSocket(
-      `${getWsBaseUrl()}/ws?room_id=${encodeURIComponent(params.id)}&user_id=${encodeURIComponent(userId)}`,
-    );
-    wsRef.current = ws;
-    setStatusText("Connecting to room…");
+    let cancelled = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
+    const MAX_BACKOFF = 15_000;
+
+    function connect() {
+      if (cancelled) return;
+
+      const ws = new WebSocket(
+        `${getWsBaseUrl()}/ws?room_id=${encodeURIComponent(params.id)}&user_id=${encodeURIComponent(userId)}&token=${encodeURIComponent(token ?? "")}`,
+      );
+      wsRef.current = ws;
+      setStatusText(attempt > 0 ? `Reconnecting (attempt ${attempt})…` : "Connecting to room…");
 
     ws.onopen = () => {
+      attempt = 0;
       setWsConnected(true);
       setStatusText("Connected. Waiting for participants…");
     };
 
     ws.onclose = () => {
       setWsConnected(false);
-      setStatusText("Disconnected from signaling server.");
+      if (!cancelled) {
+        const delay = Math.min(1000 * 2 ** attempt, MAX_BACKOFF);
+        attempt += 1;
+        setStatusText(`Disconnected. Reconnecting in ${Math.round(delay / 1000)}s…`);
+        reconnectTimer = setTimeout(connect, delay);
+      }
     };
 
     ws.onerror = () => {
-      setStatusText("Realtime signaling error. Try rejoining the room.");
+      setStatusText("Realtime signaling error.");
     };
 
-    ws.onmessage = async (event) => {
+    /* ── Serialized message queue ─────────────────────────── */
+    const signalQueue: string[] = [];
+    let draining = false;
+
+    async function drainSignalQueue() {
+      if (draining) return;
+      draining = true;
+      while (signalQueue.length > 0) {
+        await handleSignalingMsg(signalQueue.shift()!);
+      }
+      draining = false;
+    }
+
+    async function handleSignalingMsg(raw: string) {
       let msg: SignalMessage;
       try {
-        msg = JSON.parse(event.data as string) as SignalMessage;
+        msg = JSON.parse(raw) as SignalMessage;
       } catch {
         return;
       }
 
       const sourceId = msg.from ?? msg.userId;
 
-      // Server-side filtering should already handle these,
-      // but defensively filter on the client too.
       if (msg.to && msg.to !== userId) return;
       if (sourceId === userId) return;
 
       /* ── participants snapshot (sent on connect) ─────────── */
       if (msg.type === "participants") {
         const users = msg.users?.filter(Boolean) ?? [];
+        // Extract usernames from enhanced participant list if available.
+        const participantList = (msg as Record<string, unknown>).participants as
+          | { userId: string; username: string }[]
+          | undefined;
+        if (participantList) {
+          setParticipantNames((prev) => {
+            const n = new Map(prev);
+            participantList.forEach((p) => {
+              if (p.userId !== userId && p.username) {
+                n.set(p.userId, p.username);
+              }
+            });
+            return n;
+          });
+        }
         users.forEach((pid) => {
           if (pid !== userId) ensurePeer(pid);
         });
@@ -727,12 +1103,40 @@ export default function RoomPage() {
       /* ── join / leave ───────────────────────────────────── */
       if (msg.type === "join") {
         ensurePeer(sourceId);
+        // Extract username from join message if available.
+        if (msg.username) {
+          setParticipantNames((prev) => { const n = new Map(prev); n.set(sourceId, msg.username!); return n; });
+        }
         setStatusText("A participant joined.");
         return;
       }
       if (msg.type === "leave") {
         removePeer(sourceId);
+        setParticipantNames((prev) => { const n = new Map(prev); n.delete(sourceId); return n; });
         setStatusText("A participant left.");
+        return;
+      }
+
+      /* ── user-info (display name) ───────────────────────── */
+      if (msg.type === "user-info" && msg.username) {
+        setParticipantNames((prev) => { const n = new Map(prev); n.set(sourceId, msg.username!); return n; });
+        return;
+      }
+
+      /* ── real-time chat message ─────────────────────────── */
+      if (msg.type === "chat" && msg.content) {
+        setMessages((prev) => {
+          // Deduplicate by msgId if provided.
+          if (msg.msgId && prev.some((m) => m.id?.toString() === msg.msgId)) return prev;
+          const newMsg: Message = {
+            id: msg.msgId ? parseInt(msg.msgId, 10) || Date.now() : Date.now(),
+            room_id: params.id,
+            user_id: sourceId,
+            content: msg.content!,
+            created_at: msg.timestamp ?? new Date().toISOString(),
+          };
+          return [...prev, newMsg];
+        });
         return;
       }
 
@@ -796,11 +1200,22 @@ export default function RoomPage() {
           }
         }
       }
+    }
+
+    ws.onmessage = (event) => {
+      signalQueue.push(event.data as string);
+      void drainSignalQueue();
     };
+    } // end connect()
+
+    connect();
 
     return () => {
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      const ws = wsRef.current;
       wsRef.current = null;
-      ws.close();
+      if (ws) ws.close();
       setWsConnected(false);
 
       // Tear down every peer connection.
@@ -816,10 +1231,11 @@ export default function RoomPage() {
 
       // NOTE: media tracks are NOT stopped here.
       // They're managed independently and only stopped on component unmount.
+      setParticipantNames(new Map());
     };
     // All callback deps below are **stable** (no state in their dep arrays),
     // so this effect only truly re-runs when mediaReady / params.id / token change.
-  }, [mediaReady, params.id, token, ensurePeer, sendSignal, updatePeerView, removePeer]);
+  }, [hydrated, mediaReady, params.id, token, ensurePeer, sendSignal, updatePeerView, removePeer]);
 
   /* 6. Stop all media tracks on unmount */
   useEffect(() => {
@@ -827,6 +1243,7 @@ export default function RoomPage() {
       audioTrackRef.current?.stop();
       cameraTrackRef.current?.stop();
       screenTrackRef.current?.stop();
+      screenAudioTrackRef.current?.stop();
     };
   }, []);
 
@@ -842,7 +1259,8 @@ export default function RoomPage() {
 
   useEffect(() => {
     void loadMessages();
-    const id = window.setInterval(() => void loadMessages(), 4000);
+    // With real-time WS delivery, HTTP polling is just a consistency fallback.
+    const id = window.setInterval(() => void loadMessages(), 15000);
     return () => window.clearInterval(id);
   }, [loadMessages]);
 
@@ -861,11 +1279,33 @@ export default function RoomPage() {
     const text = chatInput.trim();
     setSending(true);
     setChatInput("");
+    const msgId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     try {
+      // Optimistically add message to local state.
+      const optimisticMsg: Message = {
+        id: Date.now(),
+        room_id: params.id,
+        user_id: user?.id ?? "",
+        content: text,
+        created_at: new Date().toISOString(),
+      };
+      setMessages((prev) => [...prev, optimisticMsg]);
+
+      // Broadcast via WebSocket for instant delivery to peers.
+      sendSignal({
+        type: "chat",
+        from: user?.id,
+        content: text,
+        msgId,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Also persist via HTTP API.
       await api.post("/api/chat/send", { room_id: params.id, content: text });
-      await loadMessages();
     } catch {
       setChatInput(text);
+      // Remove optimistic message on failure.
+      setMessages((prev) => prev.filter((m) => m.id !== Date.now()));
     } finally {
       setSending(false);
     }
@@ -876,6 +1316,7 @@ export default function RoomPage() {
       if (audioTrackRef.current) audioTrackRef.current.enabled = false;
       setMicOn(false);
       setStatusText("Microphone muted.");
+      publishMediaState({ micOn: false });
       return;
     }
     try {
@@ -886,9 +1327,17 @@ export default function RoomPage() {
       syncLocalMediaToPeers();
       setMicOn(true);
       setStatusText("Microphone enabled.");
-    } catch {
+      publishMediaState({ micOn: true });
+    } catch (err) {
       setMicOn(false);
-      setStatusText("Unable to access microphone.");
+      const name = (err as { name?: string })?.name;
+      if (name === "NotAllowedError") {
+        setStatusText("Microphone permission denied. Allow access in browser settings.");
+      } else if (name === "NotFoundError") {
+        setStatusText("No microphone found on this device.");
+      } else {
+        setStatusText("Unable to access microphone. Check permissions.");
+      }
     }
   };
 
@@ -897,6 +1346,7 @@ export default function RoomPage() {
       if (cameraTrackRef.current && !isScreenSharing) cameraTrackRef.current.enabled = false;
       setCamOn(false);
       setStatusText(isScreenSharing ? "Camera will remain off after sharing ends." : "Camera turned off.");
+      publishMediaState({ camOn: false });
       return;
     }
     try {
@@ -907,9 +1357,19 @@ export default function RoomPage() {
       syncLocalMediaToPeers();
       setCamOn(true);
       setStatusText(isScreenSharing ? "Camera ready for when sharing ends." : "Camera enabled.");
-    } catch {
+      publishMediaState({ camOn: true });
+    } catch (err) {
       setCamOn(false);
-      setStatusText("Unable to access camera.");
+      const name = (err as { name?: string })?.name;
+      if (name === "NotAllowedError") {
+        setStatusText("Camera permission denied. Allow access in browser settings.");
+      } else if (name === "NotFoundError") {
+        setStatusText("No camera found on this device.");
+      } else if (name === "NotReadableError") {
+        setStatusText("Camera is in use by another app. Close it and try again.");
+      } else {
+        setStatusText("Unable to access camera. Check permissions.");
+      }
     }
   };
 
@@ -921,17 +1381,35 @@ export default function RoomPage() {
     try {
       const display = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: { ideal: 15, max: 24 } },
-        audio: false,
+        audio: true, // Request audio — Chrome tab sharing can provide it.
       });
       const track = display.getVideoTracks()[0];
       if (!track) throw new Error("No screen track");
       track.contentHint = "detail";
       screenTrackRef.current = track;
+
+      // If screen share includes audio, store it and add to peers.
+      const screenAudio = display.getAudioTracks()[0] ?? null;
+      screenAudioTrackRef.current = screenAudio;
+
+      if (screenAudio) {
+        const compositeStream = localStreamRef.current ?? new MediaStream();
+        peersRef.current.forEach((runtime) => {
+          runtime.pc.addTrack(screenAudio, compositeStream);
+        });
+      }
+
+      track.onended = () => {
+        stopScreenShare(true);
+      };
+
       setIsScreenSharing(true);
+      // Publish media-state BEFORE syncing tracks so the remote peer knows
+      // isScreenSharing=true before the renegotiation offer arrives.
+      publishMediaState({ isScreenSharing: true });
       buildCompositeStream();
       syncLocalMediaToPeers();
       setStatusText("Screen sharing started.");
-      track.onended = () => stopScreenShare(true);
     } catch {
       setStatusText("Screen sharing cancelled or unavailable.");
     }
@@ -940,6 +1418,17 @@ export default function RoomPage() {
   /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
      Render
      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+  if (!hydrated) {
+    return (
+      <div className="auth-page">
+        <div className="card auth-status-card">
+          <span className="spinner" />
+          <p>Restoring your room session…</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!token) return null;
 
@@ -953,7 +1442,7 @@ export default function RoomPage() {
           <div className="rh-divider" />
           <div className="rh-room-info">
             <div className="rh-room-name">
-              {room?.is_private === 1 && (
+              {roomDetails?.is_private === 1 && (
                 <span className="rh-lock">
                   <LockSmIcon />
                 </span>
@@ -974,10 +1463,10 @@ export default function RoomPage() {
         </div>
 
         <div className="rh-right">
-          <div className="rh-pill">
+          <button className={`rh-pill${participantsOpen ? " rh-pill-active" : ""}`} onClick={() => setParticipantsOpen((v) => !v)} title="Show participants">
             <PeopleIcon />
             <span>{totalCount} in room</span>
-          </div>
+          </button>
           <button className={`rh-chat-btn${chatOpen ? " active" : ""}`} onClick={() => setChatOpen((v) => !v)} title="Toggle chat panel">
             <ChatBubbleIcon />
             {messages.length > 0 && <span className="rh-badge">{messages.length > 99 ? "99+" : messages.length}</span>}
@@ -999,19 +1488,18 @@ export default function RoomPage() {
             micOn={micOn}
             camOn={camOn}
             isScreenSharing={isScreenSharing}
-            status={isScreenSharing ? "Presenting" : localStream?.getTracks().length ? undefined : "No media"}
           />
 
           {peerList.map((peer) => (
             <VideoTile
               key={peer.userId}
               stream={peer.stream}
-              label={formatParticipantLabel(peer.userId, user?.id)}
+              label={participantNames.get(peer.userId) ?? formatParticipantLabel(peer.userId, user?.id)}
               userId={peer.userId}
               micOn={peer.micOn}
               camOn={peer.camOn}
               isScreenSharing={peer.isScreenSharing}
-              status={peer.isScreenSharing ? "Presenting" : peer.connectionState === "connected" ? undefined : peer.connectionState}
+              status={peer.connectionState === "failed" ? "reconnecting" : undefined}
             />
           ))}
 
@@ -1032,12 +1520,53 @@ export default function RoomPage() {
           )}
         </div>
 
+        {participantsOpen && (
+          <aside className="participants-panel">
+            <div className="pp-header">
+              <PeopleIcon />
+              <span>Participants ({totalCount})</span>
+              <button className="pp-close" onClick={() => setParticipantsOpen(false)}>✕</button>
+            </div>
+            <div className="pp-list">
+              <div className="pp-item">
+                <div className="pp-avatar" style={{ background: avatarColor(user?.id ?? "") }}>
+                  {user?.username?.charAt(0).toUpperCase() ?? "?"}
+                </div>
+                <span className="pp-name">{user?.username ?? "You"}</span>
+                <span className="pp-you">(You)</span>
+                <span className="pp-badges">
+                  {!micOn && <span className="pp-badge" title="Mic off">🔇</span>}
+                  {!camOn && <span className="pp-badge" title="Cam off">📷</span>}
+                  {isScreenSharing && <span className="pp-badge" title="Presenting">🖥️</span>}
+                </span>
+              </div>
+              {peerList.map((peer) => (
+                <div key={peer.userId} className="pp-item">
+                  <div className="pp-avatar" style={{ background: avatarColor(peer.userId) }}>
+                    {(participantNames.get(peer.userId) ?? peer.userId).charAt(0).toUpperCase()}
+                  </div>
+                  <span className="pp-name">
+                    {participantNames.get(peer.userId) ?? formatParticipantLabel(peer.userId, user?.id)}
+                  </span>
+                  <span className="pp-badges">
+                    {!peer.micOn && <span className="pp-badge" title="Mic off">🔇</span>}
+                    {!peer.camOn && <span className="pp-badge" title="Cam off">📷</span>}
+                    {peer.isScreenSharing && <span className="pp-badge" title="Presenting">🖥️</span>}
+                    <span className={`pp-conn-dot${peer.connectionState === "connected" ? " pp-conn-ok" : ""}`} title={peer.connectionState} />
+                  </span>
+                </div>
+              ))}
+            </div>
+          </aside>
+        )}
+
         {chatOpen && (
           <aside className="chat-panel">
             <div className="cp-header">
               <ChatBubbleIcon />
               <span>Room Chat</span>
               {messages.length > 0 && <span className="cp-count">{messages.length}</span>}
+              <button className="cp-close" onClick={() => setChatOpen(false)} title="Close chat">✕</button>
             </div>
 
             <div className="cp-messages">
